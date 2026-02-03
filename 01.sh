@@ -1,13 +1,13 @@
 #!/bin/bash
-# arch-install-btrfs-sdboot.sh
-# Clean Arch Linux installation: Btrfs + systemd-boot (с опциональным LUKS)
+# arch-install-btrfs-sdboot-no-luks.sh
+# Clean Arch Linux installation: Btrfs + systemd-boot (без шифрования)
+#
 
 set -euo pipefail
 
 # ===============================
-# CONFIGURATION - НАСТРОЙТЕ ЗДЕСЬ
+# CONFIGURATION
 # ===============================
-ENABLE_LUKS=false                    # true = с шифрованием, false = без шифрования
 HOSTNAME=""                         # Оставьте пустым для интерактивного ввода
 USERNAME=""                         # Оставьте пустым для интерактивного ввода
 ROOTPASS=""                         # Оставьте пустым для интерактивного ввода
@@ -23,19 +23,9 @@ SWAP_SIZE=4G                        # Размер файла подкачки
 [[ "$(id -u)" -ne 0 ]] && { echo "Run script as root"; exit 1; }
 [[ ! -d /sys/firmware/efi ]] && { echo "UEFI not detected"; exit 1; }
 
-# ===============================
-# DISPLAY CURRENT CONFIG
-# ===============================
 echo "========================================"
-echo "Arch Linux Installer Configuration"
+echo "Arch Linux Installer (без шифрования)"
 echo "========================================"
-echo "Encryption (LUKS): $([ "$ENABLE_LUKS" = true ] && echo "ENABLED" || echo "DISABLED")"
-echo "Timezone: $TIMEZONE"
-echo "Locale: $LOCALE"
-echo "Keymap: $KEYMAP"
-echo "Swap size: $SWAP_SIZE"
-echo "========================================"
-echo
 
 # ===============================
 # INTERACTIVE INPUT
@@ -48,7 +38,7 @@ if [[ -z "$HOSTNAME" ]]; then
     while true; do
         read -rp "Enter hostname (lowercase, no spaces): " HOSTNAME
         OLD_HOSTNAME="$HOSTNAME"
-        HOSTNAME=$(echo "$HOSTNAME" | tr '[:upper:]' '[:lower:]')   # авто-лоуэркейз
+        HOSTNAME=$(echo "$HOSTNAME" | tr '[:upper:]' '[:lower:]')
         if [[ "$HOSTNAME" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
             [[ "$OLD_HOSTNAME" != "$HOSTNAME" ]] && echo "Notice: hostname converted to lowercase: $HOSTNAME"
             break
@@ -62,7 +52,6 @@ fi
 if [[ -z "$ROOTPASS" ]]; then
     echo
     echo "=== ROOT PASSWORD SETUP ==="
-    echo "!!! ROOT PASSWORD WILL BE USED FOR SYSTEM ADMINISTRATION !!!"
     while true; do
         read -s -rp "Enter ROOT password: " ROOTPASS
         echo
@@ -80,7 +69,7 @@ if [[ -z "$USERNAME" ]]; then
     while true; do
         read -rp "Enter username (lowercase, no spaces): " USERNAME
         OLD_USERNAME="$USERNAME"
-        USERNAME=$(echo "$USERNAME" | tr '[:upper:]' '[:lower:]')   # авто-лоуэркейз
+        USERNAME=$(echo "$USERNAME" | tr '[:upper:]' '[:lower:]')
         if [[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
             [[ "$OLD_USERNAME" != "$USERNAME" ]] && echo "Notice: username converted to lowercase: $USERNAME"
             break
@@ -119,35 +108,24 @@ read -rp "Type 'yes' to continue: " confirm
 # ===============================
 # PARTITIONING
 # ===============================
+echo "Creating partitions..."
 [[ $DISK =~ [0-9]$ ]] && PARTP=p || PARTP=
 
-echo "Cleaning disk and creating partitions..."
 sgdisk -Z "$DISK"
 sgdisk -n 1:0:+1G -t 1:ef00 -c 1:EFI "$DISK"
 sgdisk -n 2:0:0  -t 2:8300 -c 2:ROOT "$DISK"
 
-# ===============================
-# LUKS ENCRYPTION (УСЛОВНО)
-# ===============================
-if [[ "$ENABLE_LUKS" = true ]]; then
-    echo "Setting up LUKS encryption..."
-    cryptsetup luksFormat --perf-no_read_workqueue --perf-no_write_workqueue --iter-time 2000 "${DISK}${PARTP}2"
-    cryptsetup open --allow-discards "${DISK}${PARTP}2" cryptroot
-    ROOT_DEVICE="/dev/mapper/cryptroot"
-    ROOT_UUID=$(blkid -s UUID -o value "${DISK}${PARTP}2")
-else
-    echo "Skipping LUKS encryption..."
-    ROOT_DEVICE="${DISK}${PARTP}2"
-    ROOT_PARTUUID=$(blkid -s PARTUUID -o value "${DISK}${PARTP}2")
-fi
+# Получаем PARTUUID корневого раздела
+ROOT_PARTUUID=$(blkid -s PARTUUID -o value "${DISK}${PARTP}2")
 
 # ===============================
 # BTRFS SUBVOLUMES
 # ===============================
 echo "Creating Btrfs filesystem and subvolumes..."
-mkfs.btrfs -f -L ArchRoot "$ROOT_DEVICE"
-mount "$ROOT_DEVICE" /mnt
+mkfs.btrfs -f -L ArchRoot "${DISK}${PARTP}2"
+mount "${DISK}${PARTP}2" /mnt
 
+# Создаем субвьюмы Btrfs
 for vol in @ @home @snapshots @log @pkg @tmp @opt @swap; do
     btrfs subvolume create "/mnt/$vol"
 done
@@ -157,10 +135,11 @@ umount /mnt
 # ===============================
 # MOUNT SUBVOLUMES
 # ===============================
+echo "Mounting subvolumes..."
 mount_opts="noatime,ssd,discard=async,compress=zstd"
 special_opts="nodatacow,compress=no"
 
-mount -o "$mount_opts,subvol=@" "$ROOT_DEVICE" /mnt
+mount -o "$mount_opts,subvol=@" "${DISK}${PARTP}2" /mnt
 
 declare -A subvolumes=( 
     [@home]="/mnt/home" 
@@ -177,11 +156,11 @@ declare -A special_subvols=(
 mkdir -p /mnt/boot "${subvolumes[@]}" "${special_subvols[@]}"
 
 for sv in "${!subvolumes[@]}"; do
-    mount -o "$mount_opts,subvol=$sv" "$ROOT_DEVICE" "${subvolumes[$sv]}"
+    mount -o "$mount_opts,subvol=$sv" "${DISK}${PARTP}2" "${subvolumes[$sv]}"
 done
 
 for sv in "${!special_subvols[@]}"; do
-    mount -o "$special_opts,subvol=$sv" "$ROOT_DEVICE" "${special_subvols[$sv]}"
+    mount -o "$special_opts,subvol=$sv" "${DISK}${PARTP}2" "${special_subvols[$sv]}"
     chattr +C "${special_subvols[$sv]}" 2>/dev/null || true
 done
 
@@ -230,16 +209,11 @@ MIRRORS
 fi
 
 # ===============================
-# PACSTRAP
+# PACSTRAP (устанавливаем базовую систему)
 # ===============================
 echo "Installing base system..."
 pacstrap -K /mnt base linux linux-firmware linux-headers \
     btrfs-progs sudo vim nano networkmanager
-
-if [[ "$ENABLE_LUKS" = true ]]; then
-    echo "Installing encryption packages..."
-    pacstrap -K /mnt cryptsetup
-fi
 
 # ===============================
 # FSTAB
@@ -281,12 +255,8 @@ echo "$USERNAME:$USERPASS" | chpasswd --crypt-method SHA512
 echo "%wheel ALL=(ALL:ALL) ALL" > /etc/sudoers.d/10-wheel
 chmod 0440 /etc/sudoers.d/10-wheel
 
-# Initramfs configuration
-if [[ "$ENABLE_LUKS" = true ]]; then
-    sed -i 's/^HOOKS=.*/HOOKS=(base systemd autodetect keyboard sd-vconsole modconf block sd-encrypt filesystems fsck)/' /etc/mkinitcpio.conf
-else
-    sed -i 's/^HOOKS=.*/HOOKS=(base systemd autodetect keyboard sd-vconsole modconf block filesystems fsck)/' /etc/mkinitcpio.conf
-fi
+# Initramfs (без хуков для шифрования)
+sed -i 's/^HOOKS=.*/HOOKS=(base systemd autodetect keyboard sd-vconsole modconf block filesystems fsck)/' /etc/mkinitcpio.conf
 mkinitcpio -P
 
 # Bootloader
@@ -298,22 +268,12 @@ console-mode max
 editor no
 LOADER
 
-# Create boot entry based on encryption setting
-if [[ "$ENABLE_LUKS" = true ]]; then
-    cat > /boot/loader/entries/arch.conf <<ENTRY
-title Arch Linux (LUKS Encrypted)
-linux /vmlinuz-linux
-initrd /initramfs-linux.img
-options rd.luks.name=$ROOT_UUID=cryptroot root=/dev/mapper/cryptroot rootflags=subvol=@ rd.luks.options=discard rd.vconsole.keymap=$KEYMAP rw
-ENTRY
-else
-    cat > /boot/loader/entries/arch.conf <<ENTRY
+cat > /boot/loader/entries/arch.conf <<ENTRY
 title Arch Linux
 linux /vmlinuz-linux
 initrd /initramfs-linux.img
 options root=PARTUUID=$ROOT_PARTUUID rootflags=subvol=@ rd.vconsole.keymap=$KEYMAP rw
 ENTRY
-fi
 
 # Create a fallback entry
 cp /boot/loader/entries/arch.conf /boot/loader/entries/arch-fallback.conf
@@ -327,29 +287,3 @@ EOF
 # ===============================
 # FINISH
 # ===============================
-swapoff "$swapfile" 2>/dev/null || true
-umount -R /mnt
-
-if [[ "$ENABLE_LUKS" = true ]]; then
-    cryptsetup close cryptroot
-fi
-
-echo -e "\n✅ Installation complete!"
-echo "========================================"
-echo "Installation Summary:"
-echo "----------------------------------------"
-echo "Hostname: $HOSTNAME"
-echo "Username: $USERNAME"
-echo "Encryption: $([ "$ENABLE_LUKS" = true ] && echo "ENABLED" || echo "DISABLED")"
-echo "Timezone: $TIMEZONE"
-echo "Locale: $LOCALE"
-echo "========================================"
-echo
-echo "Next steps:"
-echo "1. Reboot the system: sudo reboot"
-echo "2. After login: sudo pacman -Syu"
-echo "3. Install additional packages as needed"
-echo
-if [[ "$ENABLE_LUKS" = true ]]; then
-    echo "⚠️  IMPORTANT: You will be prompted for LUKS password on boot!"
-fi
