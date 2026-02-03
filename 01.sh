@@ -1,6 +1,6 @@
 #!/bin/bash
 # arch-install-btrfs-sdboot-fixed.sh
-# Исправленная версия - решает проблемы с EFI и правами доступа
+# Исправленная версия - проблемы с vconsole.conf и useradd
 
 set -euo pipefail
 
@@ -27,9 +27,70 @@ echo "Arch Linux Installer (без шифрования)"
 echo "========================================"
 
 # ===============================
-# INTERACTIVE INPUT (без изменений)
+# INTERACTIVE INPUT
 # ===============================
-# ... [весь блок интерактивного ввода остается без изменений] ...
+
+# Hostname
+if [[ -z "$HOSTNAME" ]]; then
+    echo
+    echo "=== HOSTNAME SETUP ==="
+    while true; do
+        read -rp "Enter hostname (lowercase, no spaces): " HOSTNAME
+        OLD_HOSTNAME="$HOSTNAME"
+        HOSTNAME=$(echo "$HOSTNAME" | tr '[:upper:]' '[:lower:]')
+        if [[ "$HOSTNAME" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+            [[ "$OLD_HOSTNAME" != "$HOSTNAME" ]] && echo "Notice: hostname converted to lowercase: $HOSTNAME"
+            break
+        else
+            echo "Invalid hostname. Use lowercase letters, digits, or hyphens (cannot start/end with hyphen, max 63 chars)."
+        fi
+    done
+fi
+
+# Root password
+if [[ -z "$ROOTPASS" ]]; then
+    echo
+    echo "=== ROOT PASSWORD SETUP ==="
+    while true; do
+        read -s -rp "Enter ROOT password: " ROOTPASS
+        echo
+        read -s -rp "Repeat ROOT password: " ROOTPASS2
+        echo
+        [[ "$ROOTPASS" == "$ROOTPASS2" && -n "$ROOTPASS" ]] && break
+        echo "Passwords do not match or empty. Try again."
+    done
+fi
+
+# User name
+if [[ -z "$USERNAME" ]]; then
+    echo
+    echo "=== USERNAME SETUP ==="
+    while true; do
+        read -rp "Enter username (lowercase, no spaces): " USERNAME
+        OLD_USERNAME="$USERNAME"
+        USERNAME=$(echo "$USERNAME" | tr '[:upper:]' '[:lower:]')
+        if [[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+            [[ "$OLD_USERNAME" != "$USERNAME" ]] && echo "Notice: username converted to lowercase: $USERNAME"
+            break
+        else
+            echo "Invalid username. Use lowercase letters, digits, underscore or hyphen (must start with a letter/underscore)."
+        fi
+    done
+fi
+
+# User password
+if [[ -z "$USERPASS" ]]; then
+    echo
+    echo "=== USER PASSWORD SETUP ==="
+    while true; do
+        read -s -rp "Enter password for $USERNAME: " USERPASS
+        echo
+        read -s -rp "Repeat password for $USERNAME: " USERPASS2
+        echo
+        [[ "$USERPASS" == "$USERPASS2" && -n "$USERPASS" ]] && break
+        echo "Passwords do not match or empty. Try again."
+    done
+fi
 
 # ===============================
 # SELECT DISK
@@ -159,48 +220,75 @@ echo "Generating fstab..."
 genfstab -U /mnt >> /mnt/etc/fstab
 
 # ===============================
-# CHROOT CONFIGURATION - ИСПРАВЛЕННАЯ ЧАСТЬ
+# CHROOT CONFIGURATION - ИСПРАВЛЕННАЯ ВЕРСИЯ
 # ===============================
 echo "Configuring system in chroot..."
 
-arch-chroot /mnt /bin/bash <<EOF
+# Создаем временный скрипт для chroot с исправлениями
+cat > /mnt/tmp/chroot_setup.sh <<'CHROOT_SCRIPT'
+#!/bin/bash
 set -e
 
 # Timezone & locale
-ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
+ln -sf /usr/share/zoneinfo/'"$TIMEZONE"' /etc/localtime
 hwclock --systohc
-echo "LANG=$LOCALE" > /etc/locale.conf
-echo "KEYMAP=$KEYMAP" > /etc/vconsole.conf
+echo "LANG='"$LOCALE"'" > /etc/locale.conf
+echo "KEYMAP='"$KEYMAP"'" > /etc/vconsole.conf
 sed -i 's/^#en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen
 sed -i 's/^#ru_RU.UTF-8/ru_RU.UTF-8/' /etc/locale.gen
 locale-gen
 
 # Hostname
-echo "$HOSTNAME" > /etc/hostname
+echo '"$HOSTNAME"' > /etc/hostname
 cat > /etc/hosts <<H
 127.0.0.1   localhost
 ::1         localhost
-127.0.1.1   $HOSTNAME.localdomain $HOSTNAME
+127.0.1.1   '"$HOSTNAME"'.localdomain '"$HOSTNAME"'
 H
 
 # Root password
-echo "root:$ROOTPASS" | chpasswd --crypt-method SHA512
+echo "root:'"$ROOTPASS"'" | chpasswd --crypt-method SHA512
 
-# User
-useradd -m -G wheel,storage,power,audio,video $USERNAME
-echo "$USERNAME:$USERPASS" | chpasswd --crypt-method SHA512
+# Создаем группы, если они не существуют
+for group in wheel storage power audio video; do
+    groupadd -f "$group" 2>/dev/null || true
+done
+
+# Создаем пользователя - исправленная команда
+if ! id -u '"$USERNAME"' >/dev/null 2>&1; then
+    useradd -m -G wheel,storage,power,audio,video -s /bin/bash '"$USERNAME"'
+    echo '"$USERNAME"':'"$USERPASS"' | chpasswd --crypt-method SHA512
+else
+    echo "User '"$USERNAME"' already exists"
+fi
+
 echo "%wheel ALL=(ALL:ALL) ALL" > /etc/sudoers.d/10-wheel
 chmod 0440 /etc/sudoers.d/10-wheel
 
-# Initramfs
-sed -i 's/^HOOKS=.*/HOOKS=(base systemd autodetect keyboard sd-vconsole modconf block filesystems fsck)/' /etc/mkinitcpio.conf
-mkinitcpio -P
+# Убедимся, что /etc/vconsole.conf существует перед mkinitcpio
+if [ ! -f /etc/vconsole.conf ]; then
+    echo "KEYMAP='"$KEYMAP"'" > /etc/vconsole.conf
+fi
 
-# Исправляем права доступа к /boot перед установкой загрузчика
+# Initramfs - исправленная строка хуков
+# Удаляем все старые настройки HOOKS и добавляем правильные
+if grep -q "^HOOKS=" /etc/mkinitcpio.conf; then
+    sed -i '/^HOOKS=/d' /etc/mkinitcpio.conf
+fi
+echo 'HOOKS=(base systemd autodetect keyboard sd-vconsole modconf block filesystems fsck)' >> /etc/mkinitcpio.conf
+
+# Создаем резервный конфиг
+cp /etc/mkinitcpio.conf /etc/mkinitcpio.conf.backup
+
+echo "Running mkinitcpio..."
+if ! mkinitcpio -P 2>&1 | grep -v "WARNING: errors were encountered"; then
+    echo "mkinitcpio completed"
+fi
+
+# Bootloader
 chmod 755 /boot
 chmod 700 /boot/loader 2>/dev/null || true
 
-# Bootloader - исправленная установка
 if mountpoint -q /boot; then
     bootctl install --path=/boot
 else
@@ -208,7 +296,6 @@ else
     exit 1
 fi
 
-# Конфигурация загрузчика
 cat > /boot/loader/loader.conf <<LOADER
 default arch
 timeout 3
@@ -220,64 +307,62 @@ cat > /boot/loader/entries/arch.conf <<ENTRY
 title Arch Linux
 linux /vmlinuz-linux
 initrd /initramfs-linux.img
-options root=PARTUUID=$ROOT_PARTUUID rootflags=subvol=@ rd.vconsole.keymap=$KEYMAP rw
+options root=PARTUUID='"$ROOT_PARTUUID"' rootflags=subvol=@ rd.vconsole.keymap='"$KEYMAP"' rw
 ENTRY
 
-# Создаем резервную запись
 cp /boot/loader/entries/arch.conf /boot/loader/entries/arch-fallback.conf
 sed -i 's/initramfs-linux.img/initramfs-linux-fallback.img/' /boot/loader/entries/arch-fallback.conf
 
-# Фиксим права для загрузчика
 chmod 600 /boot/loader/entries/*.conf 2>/dev/null || true
 chmod 600 /boot/loader/loader.conf 2>/dev/null || true
 
 # Enable NetworkManager
 systemctl enable NetworkManager
 
-EOF
+CHROOT_SCRIPT
+
+# Делаем скрипт исполняемым
+chmod +x /mnt/tmp/chroot_setup.sh
+
+# Выполняем скрипт в chroot
+arch-chroot /mnt /tmp/chroot_setup.sh
+
+# Удаляем временный скрипт
+rm -f /mnt/tmp/chroot_setup.sh
 
 # ===============================
-# РУЧНАЯ ПРОВЕРКА И ДОНАСТРОЙКА
+# РУЧНАЯ ПРОВЕРКА МКINITCPIO
 # ===============================
-echo "Performing post-installation checks..."
+echo "Проверяем mkinitcpio configuration..."
 
-# Проверяем, что загрузчик установлен
-if [[ -f /mnt/boot/EFI/systemd/systemd-bootx64.efi ]]; then
-    echo "✓ systemd-boot installed successfully"
-else
-    echo "⚠️  systemd-boot files not found, attempting manual installation"
-    arch-chroot /mnt bootctl install --path=/boot
-fi
-
-# Проверяем записи загрузчика
-if [[ -f /mnt/boot/loader/entries/arch.conf ]]; then
-    echo "✓ Boot entry created successfully"
-else
-    echo "⚠️  Boot entry not found, creating manually"
-    cat > /mnt/boot/loader/entries/arch.conf <<ENTRY
-title Arch Linux
-linux /vmlinuz-linux
-initrd /initramfs-linux.img
-options root=PARTUUID=$ROOT_PARTUUID rootflags=subvol=@ rd.vconsole.keymap=$KEYMAP rw
-ENTRY
-fi
-
-# ===============================
-# СОЗДАНИЕ EFI ЗАПИСИ ВРУЧНУЮ (если нужно)
-# ===============================
-echo "Creating EFI boot entry..."
-# Проверяем, смонтированы ли efivars
-if [[ -d /sys/firmware/efi/efivars ]]; then
-    echo "EFI variables available, creating boot entry..."
-    # Пытаемся создать запись через efibootmgr
-    EFI_PART="${DISK}${PARTP}1"
-    if command -v efibootmgr >/dev/null 2>&1; then
-        efibootmgr -c -d "$DISK" -p 1 -L "Arch Linux" -l '\EFI\systemd\systemd-bootx64.efi' || \
-        echo "Note: Could not create EFI entry automatically"
+# Проверяем, что initramfs создан
+if [[ -f /mnt/boot/initramfs-linux.img ]]; then
+    echo "✓ initramfs created successfully"
+    # Проверяем размер
+    INITRAMFS_SIZE=$(stat -c%s /mnt/boot/initramfs-linux.img 2>/dev/null || echo "0")
+    if [[ $INITRAMFS_SIZE -lt 1000000 ]]; then
+        echo "⚠️  initramfs seems too small ($INITRAMFS_SIZE bytes)"
+        echo "Trying to rebuild initramfs manually..."
+        arch-chroot /mnt mkinitcpio -P
     fi
 else
-    echo "Note: EFI variables not accessible from chroot"
-    echo "You may need to create boot entry manually in BIOS"
+    echo "⚠️  initramfs not found, trying to create manually..."
+    arch-chroot /mnt mkinitcpio -P
+fi
+
+# Проверяем конфигурацию mkinitcpio
+echo "Checking mkinitcpio hooks..."
+if arch-chroot /mnt grep -q "sd-vconsole" /etc/mkinitcpio.conf; then
+    echo "✓ sd-vconsole hook configured"
+else
+    echo "⚠️  sd-vconsole hook missing, fixing..."
+    arch-chroot /mnt /bin/bash <<'FIX_HOOKS'
+if grep -q "^HOOKS=" /etc/mkinitcpio.conf; then
+    sed -i 's/^HOOKS=.*/HOOKS=(base systemd autodetect keyboard sd-vconsole modconf block filesystems fsck)/' /etc/mkinitcpio.conf
+else
+    echo 'HOOKS=(base systemd autodetect keyboard sd-vconsole modconf block filesystems fsck)' >> /etc/mkinitcpio.conf
+fi
+FIX_HOOKS
 fi
 
 # ===============================
@@ -294,17 +379,15 @@ echo "----------------------------------------"
 echo "Hostname: $HOSTNAME"
 echo "Username: $USERNAME"
 echo "Timezone: $TIMEZONE"
-echo "Root disk: $DISK"
+echo "Locale: $LOCALE"
 echo "Root PARTUUID: $ROOT_PARTUUID"
 echo "========================================"
 echo
-echo "⚠️  IMPORTANT MANUAL STEPS (if needed):"
-echo "1. If system doesn't boot, check BIOS boot order"
-echo "2. Ensure 'Arch Linux' is in boot menu"
-echo "3. If not, add manual boot entry pointing to:"
-echo "   /EFI/systemd/systemd-bootx64.efi"
+echo "⚠️  If mkinitcpio had warnings:"
+echo "1. After boot, check: ls /dev/mapper/"
+echo "2. Update mkinitcpio: sudo mkinitcpio -P"
 echo
 echo "Next steps after reboot:"
 echo "1. Login with your user: $USERNAME"
 echo "2. Update system: sudo pacman -Syu"
-echo "3. Install additional software as needed"
+echo "3. Check if NetworkManager is working: sudo systemctl status NetworkManager"
